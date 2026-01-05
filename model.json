@@ -1,0 +1,167 @@
+{
+	"ComponentName":	"model",
+	"@Attach":	"",
+	"@ModelCount":	16,
+	"modelList":	{
+		"model_0":	{
+			"ModelType":	"cuboid",
+			"PropertyList":	{
+				"Length":	186.722778,
+				"width":	810.809753,
+				"height":	964.302124
+			},
+			"Posematrix4x3":	[1, 0, 0, 0, 0, 1, 0, -1, 0, -1559.638611, 998.088196, 465.404877],
+			"AdjacentModel":	["model_3", "model_9"]
+		},
+		"model_1":	{
+			"ModelType":	"cuboid",
+			"PropertyList":	{
+				"Length":	191.734268,
+				"width":	970.211456,
+				"height":	810.809753
+			},
+			"Posematrix4x3":	[1, 0, 0, 0, -1, 0, 0, 0, -1, -142.867134, 995.133530, 465.404877],
+			"AdjacentModel":	["model_2", "model_14", "model_15"]
+		},
+		"model_2":	{
+			"ModelType":	"cuboid",
+			"PropertyList":	{
+				"Length":	647.592834,
+				"width":	189.301300,
+				"height":	319.553379
+			},
+			"Posematrix4x3":	[0, 0, -1, -1, 0, 0, 0, 1, 0, -221.714094, 433.796417, 164.650650],
+			"AdjacentModel":	["model_1", "model_4", "model_8", "model_13", "model_14"]
+		},
+		"model_3":	{
+			"ModelType":	"cuboid",
+			"PropertyList":	{
+				"Length":	312.080566,
+				"width":	529.526611,
+				"height":	173.205795
+			},
+			"Posematrix4x3":	[1, 0, 0, 0, -1, 0, 0, 0, -1, -1480.614136, 374.763306, 156.602898],
+			"AdjacentModel":	["model_0", "model_4", "model_9"]
+		},
+		"model_4":	{
+			"ModelType":	"cuboid",
+			"PropertyList":	{
+				"Length":	977.283356,
+				"width":	73.850006,
+				"height":	541.005005
+			},
+			"Posematrix4x3":	[1, 0, 0, 0, 0, 1, 0, -1, 0, -848.206711, 380.502502, 190.234772],
+			"AdjacentModel":	["model_2", "model_3"]
+		},
+		"model_5":	{
+			"ModelType":	"cuboid",
+			"PropertyList":	{
+				"Length":	661.909058,
+				"width":	181.291000,
+				"height":	161.068558
+			},
+			"Posematrix4x3":	[0, 1, 0, 1, 0, 0, 0, 0, -1, -338.504768, 1200.760925, 327.394859],
+			"AdjacentModel":	["model_8"]
+		},
+		"model_6":	{
+			"ModelType":	"cuboid",
+			"PropertyList":	{
+				"Length":	622.933838,
+				"width":	156.242920,
+				"height":	161.068558
+			},
+			"Posematrix4x3":	[0, -1, 0, -1, 0, 0, 0, 0, -1, -1361.310425, 1220.248535, 327.394859],
+			"AdjacentModel":	["model_11"]
+		},
+		"model_7":	{
+			"ModelType":	"cuboid",
+			"PropertyList":	{
+				"Length":	838.656952,
+				"width":	102.689423,
+				"height":	128.034180
+			},
+			"Posematrix4x3":	[1, 0, 0, 0, 0, -1, 0, 1, 0, -857.100357, 1305.737915, 333.465073],
+			"AdjacentModel":	[""]
+		},
+		"model_8":	{
+			"ModelType":	"cuboid",
+			"PropertyList":	{
+				"Length":	957.523834,
+				"width":	269.397690,
+				"height":	189.592529
+			},
+			"Posematrix4x3":	[1, 0, 0, 0, 0, -1, 0, 1, 0, -811.705856, 780.239807, 329.813057],
+			"AdjacentModel":	["model_2", "model_5", "model_13"]
+		},
+		"model_9":	{
+			"ModelType":	"cuboid",
+			"PropertyList":	{
+				"Length":	387.953049,
+				"width":	100.666016,
+				"height":	123.895203
+			},
+			"Posematrix4x3":	[0, -1, 0, 0, 0, 1, -1, 0, 0, -1422.025024, 654.486298, 315.604836],
+			"AdjacentModel":	["model_0", "model_3", "model_10", "model_12"]
+		},
+		"model_10":	{
+			"ModelType":	"cuboid",
+			"PropertyList":	{
+				"Length":	461.978745,
+				"width":	80.249634,
+				"height":	100.569214
+			},
+			"Posematrix4x3":	[0, 0, -1, 0, 1, 0, 1, 0, 0, -1409.536682, 746.488403, 342.617683],
+			"AdjacentModel":	["model_9", "model_11", "model_12"]
+		},
+		"model_11":	{
+			"ModelType":	"cuboid",
+			"PropertyList":	{
+				"Length":	309.918900,
+				"width":	138.140320,
+				"height":	72.911987
+			},
+			"Posematrix4x3":	[0, 0, -1, 0, -1, 0, -1, 0, 0, -1426.918030, 843.730011, 385.950890],
+			"AdjacentModel":	["model_6", "model_10"]
+		},
+		"model_12":	{
+			"ModelType":	"cuboid",
+			"PropertyList":	{
+				"Length":	337.517715,
+				"width":	85.243164,
+				"height":	117.469727
+			},
+			"Posematrix4x3":	[0, 1, 0, 0, 0, -1, -1, 0, 0, -1335.212646, 742.425964, 300.068626],
+			"AdjacentModel":	["model_9", "model_10"]
+		},
+		"model_13":	{
+			"ModelType":	"cuboid",
+			"PropertyList":	{
+				"Length":	461.978745,
+				"width":	113.083786,
+				"height":	74.088135
+			},
+			"Posematrix4x3":	[0, -1, 0, 0, 0, 1, -1, 0, 0, -296.720558, 742.857239, 342.617683],
+			"AdjacentModel":	["model_2", "model_8", "model_14", "model_15"]
+		},
+		"model_14":	{
+			"ModelType":	"cuboid",
+			"PropertyList":	{
+				"Length":	387.952927,
+				"width":	123.790833,
+				"height":	56.247070
+			},
+			"Posematrix4x3":	[0, 0, 1, 0, -1, 0, 1, 0, 0, -255.765503, 658.668182, 315.604774],
+			"AdjacentModel":	["model_1", "model_2", "model_13"]
+		},
+		"model_15":	{
+			"ModelType":	"cuboid",
+			"PropertyList":	{
+				"Length":	309.918777,
+				"width":	85.499680,
+				"height":	90.411621
+			},
+			"Posematrix4x3":	[0, -1, 0, 0, 0, -1, 1, 0, 0, -266.788155, 819.865662, 385.950829],
+			"AdjacentModel":	["model_1", "model_13"]
+		}
+	}
+}
