@@ -82,7 +82,7 @@ class APF3D:
             self.env.obstacles = obstacles
         
         # 重置环境
-        self.env.reset(target_random_flag=False,obstacles_random_flag=False)
+        self.env.reset(generate_obstacles=False)
         
         # 初始化路径
         self.path = [self.env.nowpos.copy()]

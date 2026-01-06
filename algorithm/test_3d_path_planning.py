@@ -100,7 +100,7 @@ def create_3d_test_environment(complexity: str = 'medium'):
     # 设置障碍物
     for obstacle in obstacles:
         env.append_obstacle(obstacle)
-        env.reset(target_random_flag=False,obstacles_random_flag=False)
+        env.reset(generate_obstacles=False)
     
     return env, obstacles
 
@@ -455,10 +455,10 @@ if __name__ == "__main__":
     demo_3d_path_planning()
     
     # 分别测试算法
-    # apf_result = test_3d_apf()
-    # rrt_result = test_3d_rrt()
+    apf_result = test_3d_apf()
+    rrt_result = test_3d_rrt()
     
     # 比较算法性能
-    # comparison_results = compare_3d_algorithms()
+    comparison_results = compare_3d_algorithms()
     
     print("\n测试完成!")
