@@ -10,4 +10,18 @@ safe_distance: 2
 alpha_max: 0.5 
 Vmax: 1   
 model_dir: ./model 
-tool_size: [0.3,0.1] 
+tool_size: [0.3,0.1]
+# 添加缺失的参数：
+reachpos_scale: 10.0  # 位置到达阈值的缩放因子
+reachges_scale: 10.0  # 姿态到达阈值的缩放因子
+# 可选：添加渲染相关参数（如果需要）
+render_fps: 30
+# 可选：添加障碍物生成参数
+obstacle_min_size: 0.5
+obstacle_max_size: 3.0
+# 可选：添加奖励权重（如果需要）
+reward_weights:
+  step: 1.0
+  obstacle: 5.0
+  angle: 2.0
+  target_reached: 100.0

@@ -1,6 +1,7 @@
+
 import sys
 
-sys.path.append('D:\Pathplanning\PPO-PyTorch-master')
+sys.path.append('E:\pathplanning\pathplanningcode')
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
@@ -78,14 +79,6 @@ def create_3d_test_environment(complexity: str = 'medium'):
             Cuboid(size=np.array([3, 3, 8]), centerPoint=np.array([-2, -2, 4])),
             Cylinder(height=7, radius=1.8, centerPoint=np.array([2, 2, 3.5])),
             
-            # 障碍物墙
-            # for i in range(-2, 3):
-            #     for j in range(-2, 3):
-            #         if i != 0 or j != 0:
-            #             obstacles.append(
-            #                 Sphere(radius=0.8, centerPoint=np.array([i*3, j*3, 2 + abs(i*j)*0.5]))
-            #             ),
-            
             # 高空障碍物
             Sphere(radius=1.5, centerPoint=np.array([-8, 0, 9])),
             Sphere(radius=1.5, centerPoint=np.array([8, 0, 11])),
@@ -97,12 +90,154 @@ def create_3d_test_environment(complexity: str = 'medium'):
             Cuboid(size=np.array([8, 2, 5]), centerPoint=np.array([0, 4, 2.5])),
         ]
     
+        # 障碍物墙
+        for i in range(-2, 3):
+            for j in range(-2, 3):
+                if i != 0 or j != 0:
+                    obstacles.append(
+                        Sphere(radius=0.8, centerPoint=np.array([i*3, j*3, 2 + abs(i*j)*0.5]))
+                    )
     # 设置障碍物
     for obstacle in obstacles:
         env.append_obstacle(obstacle)
         env.reset(generate_obstacles=False)
     
     return env, obstacles
+
+
+def visualize_obstacle_environments():
+    """可视化三种不同复杂度的障碍物环境"""
+    fig = plt.figure(figsize=(18, 6))
+    complexities = ['simple', 'medium', 'complex']
+    titles = ['简单环境 (3个障碍物)', '中等环境 (7个障碍物)', '复杂环境 (33个障碍物)']
+    
+    for idx, complexity in enumerate(complexities):
+        # 创建环境获取障碍物列表
+        _, obstacles = create_3d_test_environment(complexity)
+        
+        # 创建3D子图
+        ax = fig.add_subplot(1, 3, idx+1, projection='3d')
+        
+        # 绘制障碍物
+        for obstacle in obstacles:
+            if hasattr(obstacle, 'centerPoint'):
+                center = obstacle.centerPoint
+                
+                # 绘制球体障碍物
+                if hasattr(obstacle, 'radius'):
+                    u, v = np.mgrid[0:2*np.pi:15j, 0:np.pi:15j]
+                    x = center[0] + obstacle.radius * np.cos(u) * np.sin(v)
+                    y = center[1] + obstacle.radius * np.sin(u) * np.sin(v)
+                    z = center[2] + obstacle.radius * np.cos(v)
+                    ax.plot_surface(x, y, z, color='red', alpha=0.6, edgecolor='darkred')
+                
+                # 绘制长方体障碍物
+                elif hasattr(obstacle, 'size'):
+                    size = obstacle.size
+                    corners = np.array([
+                        [center[0]-size[0]/2, center[1]-size[1]/2, center[2]-size[2]/2],
+                        [center[0]+size[0]/2, center[1]-size[1]/2, center[2]-size[2]/2],
+                        [center[0]+size[0]/2, center[1]+size[1]/2, center[2]-size[2]/2],
+                        [center[0]-size[0]/2, center[1]+size[1]/2, center[2]-size[2]/2],
+                        [center[0]-size[0]/2, center[1]-size[1]/2, center[2]+size[2]/2],
+                        [center[0]+size[0]/2, center[1]-size[1]/2, center[2]+size[2]/2],
+                        [center[0]+size[0]/2, center[1]+size[1]/2, center[2]+size[2]/2],
+                        [center[0]-size[0]/2, center[1]+size[1]/2, center[2]+size[2]/2],
+                    ])
+                    
+                    # 绘制长方体的边
+                    edges = [
+                        [0,1], [1,2], [2,3], [3,0],
+                        [4,5], [5,6], [6,7], [7,4],
+                        [0,4], [1,5], [2,6], [3,7]
+                    ]
+                    
+                    for edge in edges:
+                        ax.plot(
+                            [corners[edge[0],0], corners[edge[1],0]],
+                            [corners[edge[0],1], corners[edge[1],1]],
+                            [corners[edge[0],2], corners[edge[1],2]],
+                            'blue', alpha=0.7, linewidth=2
+                        )
+                
+                # 绘制圆柱体障碍物
+                elif hasattr(obstacle, 'height') and hasattr(obstacle, 'radius'):
+                    height = obstacle.height
+                    radius = obstacle.radius
+                    
+                    # 绘制侧面
+                    theta = np.linspace(0, 2*np.pi, 20)
+                    z_side = np.linspace(center[2]-height/2, center[2]+height/2, 5)
+                    theta_grid, z_grid = np.meshgrid(theta, z_side)
+                    x_side = center[0] + radius * np.cos(theta_grid)
+                    y_side = center[1] + radius * np.sin(theta_grid)
+                    ax.plot_surface(x_side, y_side, z_grid, color='green', alpha=0.6, edgecolor='darkgreen')
+                    
+                    # 绘制顶部和底部圆盘
+                    for z_offset in [-height/2, height/2]:
+                        theta = np.linspace(0, 2*np.pi, 30)
+                        r = np.linspace(0, radius, 10)
+                        theta_grid, r_grid = np.meshgrid(theta, r)
+                        x_disk = center[0] + r_grid * np.cos(theta_grid)
+                        y_disk = center[1] + r_grid * np.sin(theta_grid)
+                        z_disk = np.full_like(x_disk, center[2] + z_offset)
+                        ax.plot_surface(x_disk, y_disk, z_disk, color='green', alpha=0.6, edgecolor='darkgreen')
+        
+        # 绘制起点和终点
+        start_pos = np.array([-10, -10, 2])
+        target_pos = np.array([12, 12, 10])
+        
+        ax.scatter(start_pos[0], start_pos[1], start_pos[2], 
+                  c='green', s=150, marker='o', label='起点', edgecolors='black', linewidth=2)
+        ax.scatter(target_pos[0], target_pos[1], target_pos[2], 
+                  c='yellow', s=200, marker='*', label='终点', edgecolors='black', linewidth=2)
+        
+        # 设置坐标轴
+        ax.set_xlabel('X轴', fontsize=10)
+        ax.set_ylabel('Y轴', fontsize=10)
+        ax.set_zlabel('Z轴', fontsize=10)
+        ax.set_xlim(-15, 15)
+        ax.set_ylim(-15, 15)
+        ax.set_zlim(0, 15)
+        ax.set_title(titles[idx], fontsize=12, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.view_init(elev=25, azim=45)
+        
+        # 添加图例
+        if idx == 0:
+            ax.legend(loc='upper left', fontsize=9)
+    
+    plt.suptitle('三维路径规划测试环境 - 障碍物可视化', fontsize=16, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    plt.savefig('obstacle_environments_visualization.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # 打印障碍物统计信息
+    print("\n" + "="*60)
+    print("障碍物环境统计信息")
+    print("="*60)
+    
+    for complexity in complexities:
+        _, obstacles = create_3d_test_environment(complexity)
+        
+        # 统计不同类型障碍物的数量
+        sphere_count = 0
+        cuboid_count = 0
+        cylinder_count = 0
+        
+        for obstacle in obstacles:
+            if hasattr(obstacle, 'radius') and not hasattr(obstacle, 'height'):
+                sphere_count += 1
+            elif hasattr(obstacle, 'size'):
+                cuboid_count += 1
+            elif hasattr(obstacle, 'height') and hasattr(obstacle, 'radius'):
+                cylinder_count += 1
+        
+        print(f"\n{complexity.capitalize()}环境:")
+        print(f"  总障碍物数量: {len(obstacles)}")
+        print(f"  球体障碍物: {sphere_count}")
+        print(f"  长方体障碍物: {cuboid_count}")
+        print(f"  圆柱体障碍物: {cylinder_count}")
 
 
 def test_3d_apf():
@@ -451,12 +586,15 @@ def demo_3d_path_planning():
 if __name__ == "__main__":
     print("开始三维路径规划测试...")
     
+    # 首先可视化障碍物环境
+    visualize_obstacle_environments()
+    
     # 运行演示
-    demo_3d_path_planning()
+    #demo_3d_path_planning()
     
     # 分别测试算法
-    apf_result = test_3d_apf()
-    rrt_result = test_3d_rrt()
+    #apf_result = test_3d_apf()
+    #rrt_result = test_3d_rrt()
     
     # 比较算法性能
     comparison_results = compare_3d_algorithms()

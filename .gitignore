@@ -40,3 +40,4 @@ __pycache__/
 *.fls
 sac_tensorboard
 *.pth
+*.npz
