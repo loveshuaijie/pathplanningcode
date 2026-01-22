@@ -3,7 +3,7 @@ envyrange: [-10,10]
 envzrange: [-10,10]
 start: [0,0,0,0,0,0]
 target: [2,8,-5,2,1,1]
-obstacles_num: 8  
+obstacles_num: 5
 maxstep: 1000 
 period: 0.2 
 safe_distance: 2 
@@ -11,6 +11,7 @@ alpha_max: 0.5
 Vmax: 1   
 model_dir: ./model 
 tool_size: [0.3,0.1]
+goal_conditioned: True
 # 添加缺失的参数：
 reachpos_scale: 10.0  # 位置到达阈值的缩放因子
 reachges_scale: 10.0  # 姿态到达阈值的缩放因子

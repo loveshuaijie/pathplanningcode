@@ -1,789 +1,378 @@
-# 修改后的 MapEnv.py（增加 seed 支持）
 import numpy as np
-from AxisPathPlanEnv.Prime import *
-from AxisPathPlanEnv.util import *
+import gymnasium as gym
+from gymnasium import spaces
 import fcl
-from gym import spaces
-from AxisPathPlanEnv.State import State
-from AxisPathPlanEnv.Action import Action
-import gym
-import random
-from typing import Tuple, List, Optional, Dict, Any, Union
+from typing import Tuple, Dict, Any, Union, Optional
+
+# 引用你的自定义模块
+from AxisPathPlanEnv.Prime import Cylinder, Sphere, Cuboid
+from AxisPathPlanEnv.util import calculate_distance, calculate_angle, euler_to_rotation_matrix, save_plot_3d_path
 
 class MapEnv(gym.Env):
-    """通用路径规划环境（增加可选 goal-conditioned 支持，向后兼容）
-       增加了 seed(self, seed=None) 方法以支持可复现性。
     """
-    
-    def __init__(self, env_config: Dict[str, Any], render_mode: str = None) -> None:
-        """初始化环境
+    基于 Gymnasium 标准重构的 3D 路径规划环境
+    支持 HER (Hindsight Experience Replay) 和 FCL 碰撞检测
+    """
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
 
-        Args:
-            env_config: 环境配置字典
-                可选键 'goal_conditioned' (bool) - 若为 True，则 reset/step 返回符合 Gym GoalEnv 风格的 dict:
-                    {'observation', 'achieved_goal', 'desired_goal'}（由 Vec/HER 使用）
-                可选键 'seed' (int) - 若提供，则在构造时调用 self.seed(seed) 以固定随机性（障碍物等）
-            render_mode: 渲染模式，支持None（不渲染）或'human'
-        """
+    def __init__(self, env_config: Dict[str, Any], render_mode: Optional[str] = None) -> None:
         super().__init__()
         self.render_mode = render_mode
-        
-        # internal seed holder
-        self._seed = None
-        
-        # goal-conditioned 开关（默认 False 保持兼容）
-        self.goal_conditioned = bool(env_config.get("goal_conditioned", False))
-        
-        # 环境边界
-        self.xrange = env_config["envxrange"]
-        self.yrange = env_config["envyrange"]
-        self.zrange = env_config["envzrange"]
-        
-        # 障碍物
-        self.obstacles = []
+        MAX_OBS_DETECT = 10
+        # --- 1. 配置加载 ---
+        self.x_range = np.array(env_config["envxrange"])
+        self.y_range = np.array(env_config["envyrange"])
+        self.z_range = np.array(env_config["envzrange"])
         self.obstacles_num = env_config["obstacles_num"]
         
-        # 起点和终点
-        self.start = np.array(env_config["start"])
-        self.target = np.array(env_config["target"])
-        self.startpos = self.start[0:3]
-        self.startges = self.start[3:6]
-        self.targetpos = self.target[0:3]
-        self.targetges = self.target[3:6]
+        # 物理/工具参数
+        self.tool_size = env_config["tool_size"] 
+        self.max_step = env_config["maxstep"] 
+        self.dt = env_config["period"] 
+        self.safe_distance = env_config["safe_distance"] 
+        self.alpha_max = env_config["alpha_max"] 
+        self.v_max = env_config.get("Vmax", 1.0)
         
-        # 状态变量
-        self.totalreward = 0
-        self.done = False
-        self.nowpos = self.startpos.copy()
-        self.nowges = self.startges.copy()
-        self.lastpos = self.startpos.copy()
-        self.lastges = self.startges.copy()
-        self.last_dis_to_target = 0
-        self.last_dir_to_target = 0
-        self.goal_distance = 0
-        self.last_dis_to_obstacle = [0 for _ in range(self.obstacles_num)]
-        self.lastpath = np.array([0, 0, 0])
+        # 缩放因子
+        self.reach_pos_scale = env_config.get("reachpos_scale", 10.0)
+        self.reach_ges_scale = env_config.get("reachges_scale", 10.0)
+
+        # HER 配置
+        self.goal_conditioned = env_config.get("goal_conditioned", False)
+        self.reward_type = env_config.get("reward_type", "dense") # 'sparse' or 'dense'
+
+        # --- 2. 状态变量初始化 ---
+        self.start_pos = np.array(env_config["start"][0:3], dtype=np.float32)
+        self.start_ges = np.array(env_config["start"][3:6], dtype=np.float32)
+        self.target_pos = np.array(env_config["target"][0:3], dtype=np.float32)
+        self.target_ges = np.array(env_config["target"][3:6], dtype=np.float32)
+
+        self.now_pos = self.start_pos.copy()
+        self.now_ges = self.start_ges.copy()
+        self.last_pos = self.start_pos.copy()
+        self.last_ges = self.start_ges.copy()
+        
+        self.obstacles = []
+        self.moving_tool = None # 在 reset 中初始化
         self.timestep = 0
-        self.trajectory = []
+
+        # --- 3. 定义空间 (Action & Observation) ---
+        # 动作: [vx, vy, vz, d_roll, d_pitch, d_yaw]
+        self.action_space = spaces.Box(low=-1, high=1, shape=(6,), dtype=np.float32)
+
+        # 预计算观测维度 (Pos(3) + Ges(3) + Vel(3) + AngVel(3) + ObstacleInfo(Num*4))
+        # 注意：这里假设每个障碍物提供距离(1) + 方向(3) = 4维信息
         
-        # 工具参数
-        self.tool_size = env_config["tool_size"]
+
+        if self.goal_conditioned:
+            obs_dim = 6 + 6 + (MAX_OBS_DETECT * 4) 
+            self.observation_space = spaces.Dict({
+                "observation": spaces.Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32),
+                "achieved_goal": spaces.Box(-np.inf, np.inf, shape=(6,), dtype=np.float32),
+                "desired_goal": spaces.Box(-np.inf, np.inf, shape=(6,), dtype=np.float32),
+            })
+        else:
+            # 非 HER 模式通常需要把 Target 相对位置放入 Observation
+            # 这里为了简化，保持与 feature_dim 一致，但在 _get_obs 中拼接 target 差值
+            flat_dim = self.obs_feature_dim + 6 + 2 # + TargetRel(6) + Dists(2)
+            self.observation_space = spaces.Box(-np.inf, np.inf, shape=(flat_dim,), dtype=np.float32)
+
+    def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[Dict, Dict]:
+        # 1. Gymnasium 标准随机数初始化
+        super().reset(seed=seed) 
+        
+        # 解析 options
+        options = options or {}
+        target_random = options.get('target_random', True)
+        obstacles_random = options.get('obstacles_random', True)
+
+        # 2. 重置状态
+        self.timestep = 0
+        self.now_pos = self.start_pos.copy()
+        self.now_ges = self.start_ges.copy()
+        self.last_pos = self.start_pos.copy()
+        self.last_ges = self.start_ges.copy()
+        self.trajectory = [self.now_pos.copy()]
+        
+        # 3. 初始化工具模型
+        self._update_tool_model()
+
+        # 4. 生成场景
+        if target_random:
+            self._generate_random_target()
+        
+        # 总是重新生成障碍物，确保其位置有效性
+        if obstacles_random or not self.obstacles:
+            self._generate_valid_obstacles()
+        
+        # 5. 更新距离阈值 (根据任务难度动态调整)
+        self.goal_dist_init = calculate_distance(self.start_pos, self.target_pos)
+        self.goal_ges_init = calculate_distance(self.start_ges, self.target_ges)
+        
+        # 这里的逻辑保留你原有的：阈值随距离动态变化，但不能小于 0.1
+        self.reach_dist_threshold = max(self.goal_dist_init / self.reach_pos_scale, 0.1)
+        self.reach_ges_threshold = max(self.goal_ges_init / self.reach_ges_scale, 0.1)
+
+        # 6. 获取初始观测
+        obs = self._get_obs()
+        info = self._get_info()
+        
+        return obs, info
+
+    def step(self, action: np.ndarray) -> Tuple[Any, float, bool, bool, Dict]:
+        # 1. 记录上一步
+        self.last_pos = self.now_pos.copy()
+        self.last_ges = self.now_ges.copy()
+        
+        # 2. 物理更新
+        # 动作裁剪与缩放
+        action = np.clip(action, self.action_space.low, self.action_space.high)
+        scaled_pos_act = action[0:3] * self.v_max
+        scaled_ges_act = action[3:6] # 假设姿态速度不需要额外缩放，或者也在 v_max 内
+        
+        self.now_pos += scaled_pos_act * self.dt
+        self.now_ges += scaled_ges_act * self.dt
+        
+        #self._update_tool_model()
+        self.trajectory.append(self.now_pos.copy())
+        self.timestep += 1
+
+        # 3. 获取观测
+        obs = self._get_obs()
+        
+        # 4. 判定状态
+        is_success = self._is_success(self.now_pos, self.now_ges, self.target_pos, self.target_ges)
+        is_collision = self._check_collision()
+        is_out_of_bounds = self._check_out_of_bounds()
+        
+        # 5. 终止条件 (Gymnasium 分为 terminated 和 truncated)
+        terminated = is_success or is_collision or is_out_of_bounds
+        truncated = self.timestep >= self.max_step
+        
+        info = self._get_info()
+        info['is_success'] = is_success
+        info['is_collision'] = is_collision
+
+        # 6. 计算奖励
+        if self.goal_conditioned:
+            reward = self.compute_reward(obs['achieved_goal'], obs['desired_goal'], info)
+        else:
+            reward = self._compute_dense_reward(is_success, is_collision or is_out_of_bounds, truncated)
+
+        return obs, reward, terminated, truncated, info
+
+    def compute_reward(self, achieved_goal, desired_goal, info):
+        """
+        HER 必须实现的接口，支持 Batch 计算
+        """
+        # 确保输入是 numpy 数组
+        ag = np.array(achieved_goal)
+        dg = np.array(desired_goal)
+        
+        # 如果是单个样本，扩展维度以便统一处理
+        if ag.ndim == 1:
+            ag = ag.reshape(1, -1)
+            dg = dg.reshape(1, -1)
+            
+        # 计算距离 (位置 + 姿态)
+        # 假设前3维是位置，后3维是姿态
+        d_pos = np.linalg.norm(ag[:, :3] - dg[:, :3], axis=1)
+        d_ges = np.linalg.norm(ag[:, 3:] - dg[:, 3:], axis=1)
+        
+        # 判定是否成功 (Batch wise)
+        # 注意：这里使用 self.reach_dist_threshold 可能有问题，因为 HER 回放时阈值应该是当初那个 episode 的
+        # 但为了简化，通常取一个固定的小值，或者认为当前环境参数是全局通用的
+        success = (d_pos < self.reach_dist_threshold) & (d_ges < self.reach_ges_threshold)
+        
+        if self.reward_type == 'sparse':
+            # 成功 0，失败 -1
+            return (success.astype(np.float32) - 1.0).squeeze()
+        else:
+            # 密集奖励: 负距离
+            return -(d_pos + d_ges).squeeze()
+
+    # ================= 内部辅助方法 =================
+
+    def _get_obs(self) -> Union[Dict, np.ndarray]:
+        """生成观测向量，替代原本的 State.py"""
+        # 1. 基础物理量
+        pos_vel = self.now_pos - self.last_pos
+        ges_vel = self.now_ges - self.last_ges
+        
+        # --- 核心修改：处理障碍物 ---
+        all_obs_info = []
+        MAX_OBS_DETECT = 10
+        req = fcl.DistanceRequest(enable_nearest_points=True)
+        
+        # 1. 遍历所有障碍物，计算距离并存储
+        temp_obstacles = []
+        for obs in self.obstacles:
+            res = fcl.DistanceResult()
+            dist = fcl.distance(obs.modelforfcl, self.moving_tool.modelforfcl, req, res)
+            
+            vec = obs.centerPoint - self.now_pos
+            # 简单的防除零
+            norm_vec = vec / (np.linalg.norm(vec) + 1e-6)
+            
+            temp_obstacles.append({
+                'dist': dist,
+                'vec': norm_vec
+            })
+            
+        # 2. 按距离从小到大排序 (关注最近的危险)
+        temp_obstacles.sort(key=lambda x: x['dist'])
+        
+        # 3. 截断与填充
+        obs_features = []
+        for i in range(MAX_OBS_DETECT):
+            if i < len(temp_obstacles):
+                # 有真实障碍物
+                o = temp_obstacles[i]
+                obs_features.extend([o['dist'], *o['vec']])
+            else:
+                # 填充“虚拟障碍物” (放在无穷远处，或者 safe_distance 之外很远)
+                # 建议：dist 设为一个大数 (如 100.0)，方向设为 0
+                obs_features.extend([20.0, 0.0, 0.0, 0.0])
+                
+        # 转换 convert list to array...
+        # 拼接到最终的 self.states 中
+
+        # 3. 组装 HER Observation (纯净的状态，不包含 Target)
+        # 包含：速度, 绝对坐标, 绝对姿态, 障碍物信息
+        obs_vec = np.concatenate([
+            pos_vel,
+            ges_vel,
+            self.now_pos, 
+            self.now_ges,
+            np.array(obs_features, dtype=np.float32)
+        ]).astype(np.float32)
+
+        if self.goal_conditioned:
+            return {
+                'observation': obs_vec,
+                'achieved_goal': np.concatenate([self.now_pos, self.now_ges]).astype(np.float32),
+                'desired_goal': np.concatenate([self.target_pos, self.target_ges]).astype(np.float32)
+            }
+        else:
+            # 非 HER 模式：需要把目标相对位置加进去
+            rel_pos = self.target_pos - self.now_pos
+            rel_ges = self.target_ges - self.now_ges
+            dist_p = calculate_distance(self.now_pos, self.target_pos)
+            dist_g = calculate_distance(self.now_ges, self.target_ges)
+            
+            flat_obs = np.concatenate([
+                rel_pos, rel_ges, obs_vec, [dist_p, dist_g]
+            ]).astype(np.float32)
+            return flat_obs
+
+    def _update_tool_model(self):
+        rotation_matrix = euler_to_rotation_matrix(self.now_ges[0], self.now_ges[1], self.now_ges[2])
         self.moving_tool = Cylinder(
             height=self.tool_size[0], 
             radius=self.tool_size[1], 
-            centerPoint=self.nowpos
-        )
-        
-        # 环境参数
-        self.maxstep = env_config["maxstep"]
-        self.period = env_config["period"]
-        self.safe_distance = env_config["safe_distance"]
-        self.alpha_max = env_config["alpha_max"]
-        self.reachpos_scale = env_config["reachpos_scale"]
-        self.reachges_scale = env_config["reachges_scale"]
-        self.Vmax = env_config.get("Vmax", 1.0)
-        
-        # 计算初始目标距离和角度
-        self.goal_distance = calculate_distance(self.startpos, self.targetpos)
-        self.goal_dir_to_target = calculate_distance(self.startges, self.targetges)
-        self.reach_distance = self.goal_distance / self.reachpos_scale
-        self.reach_ges = self.goal_dir_to_target / self.reachges_scale
-        
-        # 确保到达阈值不为零
-        if self.reach_distance < 0.1:
-            self.reach_distance = 0.1
-        if self.reach_ges < 0.1:
-            self.reach_ges = 0.1
-        
-        # 默认用 State 来推断 state 维度
-        state = State(self)
-        state_dim = len(state.states)
-
-        # 若启用了 goal_conditioned，构建符合 HER/GoalEnv 的 observation_space（Dict）
-        if self.goal_conditioned:
-            obs_dim = max(len(state.states) - 6, 1)
-            self.observation_space = spaces.Dict({
-                'observation': spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32),
-                'achieved_goal': spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
-                'desired_goal': spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32)
-            })
-        else:
-            self.observation_space = spaces.Box(
-                low=-10, high=10, shape=(state_dim,), dtype=np.float32
-            )
-
-        # 动作空间保持不变
-        self.action_space = spaces.Box(
-            low=-1, high=1, shape=(6,), dtype=np.float32
-        )
-        
-        # 用于非强化学习算法的规划状态
-        self._planning_state = {
-            'path': [],
-            'collision_checks': 0,
-            'planning_time': 0,
-            'nodes_expanded': 0
-        }
-        
-        # 如果 env_config 中提供了 seed，则在初始化阶段固定种子（以便可复现生成障碍等）
-        if "seed" in env_config and env_config["seed"] is not None:
-            try:
-                self.seed(int(env_config["seed"]))
-            except Exception:
-                pass
-
-        self.reset()
-    
-    # ==================== 基础环境操作 ====================
-    
-    def seed(self, seed: Optional[int] = None) -> List[int]:
-        """
-        为环境设置随机种子，固定 numpy.random 和 python random（并尝试设置 torch 的种子）。
-        返回值：包含设置的整数种子（符合 gym.Env.seed 的常见约定）
-        用法：
-            env.seed(123)
-        注意：
-            - 该方法不会保证第三方库（如 fcl 内部）完全可复现，但会使 obstacle 生成与 numpy/random 相关的部分可复现。
-        """
-        if seed is None:
-            seed = np.random.randint(0, 2**31 - 1)
-        seed = int(seed)
-        self._seed = seed
-        # python random
-        random.seed(seed)
-        # numpy
-        np.random.seed(seed)
-        # torch if available
-        try:
-            import torch
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)
-        except Exception:
-            pass
-        return [seed]
-    
-    def reset(self, 
-              start: Optional[np.ndarray] = None,
-              target: Optional[np.ndarray] = None,
-              generate_obstacles: bool = True,
-              obstacle_list: Optional[List] = None) -> Union[np.ndarray, Dict[str, np.ndarray]]:
-        """重置环境
-
-        返回：
-            如果 goal_conditioned == False: 返回 flat 状态向量（与原来兼容）
-            如果 goal_conditioned == True: 返回 dict {'observation','achieved_goal','desired_goal'}
-        """
-        # 设置起点
-        if start is not None:
-            self.start = np.array(start)
-            self.startpos = self.start[0:3]
-            self.startges = self.start[3:6]
-        
-        # 设置终点
-        if target is not None:
-            self.target = np.array(target)
-            self.targetpos = self.target[0:3]
-            self.targetges = self.target[3:6]
-        else:
-            # 如果未指定目标且配置允许随机生成，则随机生成目标
-            if generate_obstacles:
-                targetpos = np.random.uniform(low=-10, high=10, size=(3,))
-                targetges = np.random.uniform(low=-np.pi, high=np.pi, size=(3,))
-                self.target = np.concatenate((targetpos, targetges))
-                self.targetpos = self.target[0:3]
-                self.targetges = self.target[3:6]
-        
-        # 重置状态变量
-        self.nowpos = self.startpos.copy()
-        self.nowges = self.startges.copy()
-        self.totalreward = 0
-        self.done = False
-        self.timestep = 0
-        self.trajectory = [self.nowpos.copy()]
-        self._planning_state = {
-            'path': [],
-            'collision_checks': 0,
-            'planning_time': 0,
-            'nodes_expanded': 0
-        }
-        
-        # 设置或生成障碍物
-        if obstacle_list is not None:
-            self.obstacles = obstacle_list
-        elif generate_obstacles:
-            self.generate_obstacles()
-        
-        # 更新工具位置
-        rotation_matrix = euler_to_rotation_matrix(
-            self.nowges[0], self.nowges[1], self.nowges[2]
-        )
-        self.moving_tool = Cylinder(
-            height=self.tool_size[0],
-            radius=self.tool_size[1],
-            centerPoint=self.nowpos,
+            centerPoint=self.now_pos, 
             orientation=rotation_matrix
         )
-        
-        # 更新距离计算
-        self.goal_distance = calculate_distance(self.startpos, self.targetpos)
-        self.goal_dir_to_target = calculate_distance(self.startges, self.targetges)
-        self.reach_distance = self.goal_distance / self.reachpos_scale
-        self.reach_ges = self.goal_dir_to_target / self.reachges_scale
-        
-        if self.reach_distance < 0.1:
-            self.reach_distance = 0.1
-        if self.reach_ges < 0.1:
-            self.reach_ges = 0.1
-        
-        # 创建并返回初始状态
-        self.state = State(self)
-        # 若 goal_conditioned，返回 dict 格式
-        if self.goal_conditioned:
-            return self._build_goal_dict()
-        return self.state.states
-    
-    def _build_goal_dict(self) -> Dict[str, np.ndarray]:
-        """构建 goal-format 的 observation dict:
-           - observation : 状态向量中去掉 target 相关分量的部分（供 policy 使用）
-           - achieved_goal : 当前实现的目标（nowpos）
-           - desired_goal : 当前目标（targetpos）
-        """
-        s = self.state.states
-        # remove first 6 entries (targetpos_relative and targetgesture_relative)
-        if len(s) > 6:
-            obs_no_goal = np.array(s[6:], dtype=np.float32)
-        else:
-            # 兜底：若 State 结构不符合预期，返回全量 state 作为 observation
-            obs_no_goal = np.array(s, dtype=np.float32)
-        achieved = np.array(self.nowpos, dtype=np.float32)
-        desired = np.array(self.targetpos, dtype=np.float32)
-        return {
-            'observation': obs_no_goal,
-            'achieved_goal': achieved,
-            'desired_goal': desired
-        }
 
-    def step(self, action: np.ndarray) -> Tuple[Union[np.ndarray, Dict[str, np.ndarray]], float, bool, Dict]:
-        """执行一步动作（强化学习接口）
+    def _generate_random_target(self):
+        # 使用 gymnasium 提供的随机数生成器
+        pos = self.np_random.uniform(low=-10, high=10, size=(3,))
+        ges = self.np_random.uniform(low=-np.pi, high=np.pi, size=(3,))
+        self.target_pos = pos
+        self.target_ges = ges
 
-        返回 obs, reward, done, info
-        当 goal_conditioned=True 时，obs 为 dict 格式 (observation, achieved_goal, desired_goal)
-        """
-        return self._execute_action(action, compute_reward=True)
-    
-    # ==================== 路径规划接口 ====================
-    
-    def plan_step(self, new_position: np.ndarray, new_orientation: Optional[np.ndarray] = None) -> Dict[str, Any]:
-        """为传统路径规划算法设计的步进函数
-        （此部分未改动，保持与原来行为一致）
-        """
-        # 记录规划步骤
-        self._planning_state['nodes_expanded'] += 1
-        
-        # 计算新姿态
-        if new_orientation is None:
-            new_orientation = self.nowges.copy()
-        
-        # 检查边界
-        if not self._check_bounds(new_position):
-            return {
-                'success': False,
-                'collision': False,
-                'out_of_bounds': True,
-                'position': self.nowpos.copy(),
-                'orientation': self.nowges.copy(),
-                'distance_to_target': calculate_distance(self.nowpos, self.targetpos),
-                'distance_to_obstacles': self._get_distances_to_obstacles()
-            }
-        
-        # 检查碰撞
-        rotation_matrix = euler_to_rotation_matrix(
-            new_orientation[0], new_orientation[1], new_orientation[2]
-        )
-        temp_tool = Cylinder(
-            height=self.tool_size[0],
-            radius=self.tool_size[1],
-            centerPoint=new_position,
-            orientation=rotation_matrix
-        )
-        
-        self._planning_state['collision_checks'] += 1
-        
-        if self._check_collision(temp_tool):
-            return {
-                'success': False,
-                'collision': True,
-                'out_of_bounds': False,
-                'position': self.nowpos.copy(),
-                'orientation': self.nowges.copy(),
-                'distance_to_target': calculate_distance(self.nowpos, self.targetpos),
-                'distance_to_obstacles': self._get_distances_to_obstacles()
-            }
-        
-        # 执行移动
-        self.lastpos = self.nowpos.copy()
-        self.lastges = self.nowges.copy()
-        self.nowpos = new_position.copy()
-        self.nowges = new_orientation.copy()
-        self.moving_tool = temp_tool
-        self.trajectory.append(self.nowpos.copy())
-        
-        # 更新状态
-        self.state = State(self)
-        self.timestep += 1
-        
-        # 检查终止条件
-        reached_target = self.judgeTarget()
-        collision = False  # 已经检查过碰撞
-        timeout = self.judgeTime()
-        
-        if reached_target:
-            self.done = True
-            self.trajectory.append(self.targetpos.copy())
-        
-        return {
-            'success': True,
-            'collision': False,
-            'out_of_bounds': False,
-            'position': self.nowpos.copy(),
-            'orientation': self.nowges.copy(),
-            'distance_to_target': calculate_distance(self.nowpos, self.targetpos),
-            'distance_to_obstacles': self._get_distances_to_obstacles(),
-            'reached_target': reached_target,
-            'timeout': timeout
-        }
-    
-    def get_valid_neighbors(self, position: np.ndarray, orientation: np.ndarray, 
-                           step_size: float = 1.0) -> List[Dict[str, Any]]:
-        """获取当前位置的有效邻居位置（用于图搜索算法）"""
-        neighbors = []
-        directions = [
-            (step_size, 0, 0),
-            (-step_size, 0, 0),
-            (0, step_size, 0),
-            (0, -step_size, 0),
-            (0, 0, step_size),
-            (0, 0, -step_size)
-        ]
-        
-        for dx, dy, dz in directions:
-            new_pos = position + np.array([dx, dy, dz])
-            
-            # 检查边界
-            if not self._check_bounds(new_pos):
-                continue
-            
-            # 检查碰撞
-            temp_tool = Cylinder(
-                height=self.tool_size[0],
-                radius=self.tool_size[1],
-                centerPoint=new_pos,
-                orientation=euler_to_rotation_matrix(
-                    orientation[0], orientation[1], orientation[2]
-                )
-            )
-            
-            if not self._check_collision(temp_tool):
-                # 计算启发式成本（到目标的欧氏距离）
-                cost = calculate_distance(new_pos, position)  # 移动距离作为成本
-                heuristic = calculate_distance(new_pos, self.targetpos)
-                
-                neighbors.append({
-                    'position': new_pos,
-                    'orientation': orientation,
-                    'cost': cost,
-                    'heuristic': heuristic,
-                    'total_cost': cost + heuristic
-                })
-        
-        return neighbors
-    
-    def evaluate_path(self, path: List[np.ndarray]) -> Dict[str, Any]:
-        """评估给定路径的质量（未改动）"""
-        if len(path) == 0:
-            return {'valid': False, 'length': 0, 'collisions': 0}
-        
-        # 保存当前状态
-        original_state = {
-            'nowpos': self.nowpos.copy(),
-            'nowges': self.nowges.copy(),
-            'trajectory': self.trajectory.copy(),
-            'timestep': self.timestep
-        }
-        
-        # 评估路径
-        collisions = 0
-        path_length = 0
-        valid = True
-        
-        # 重置到起点
-        self.nowpos = self.startpos.copy()
-        self.nowges = self.startges.copy()
-        
-        for i, point in enumerate(path):
-            if len(point) == 3:
-                # 只有位置，使用当前姿态
-                result = self.plan_step(point, self.nowges)
-            else:
-                # 包含姿态
-                result = self.plan_step(point[:3], point[3:6])
-            
-            if i > 0:
-                prev_point = path[i-1]
-                path_length += calculate_distance(
-                    prev_point[:3] if len(prev_point) > 3 else prev_point,
-                    point[:3] if len(point) > 3 else point
-                )
-            
-            if result['collision']:
-                collisions += 1
-                valid = False
-                break
-            
-            if result['out_of_bounds']:
-                valid = False
-                break
-        
-        # 恢复原始状态
-        self.nowpos = original_state['nowpos']
-        self.nowges = original_state['nowges']
-        self.trajectory = original_state['trajectory']
-        self.timestep = original_state['timestep']
-        
-        return {
-            'valid': valid,
-            'length': path_length,
-            'collisions': collisions,
-            'distance_to_target': calculate_distance(self.nowpos, self.targetpos) 
-            if valid else float('inf'),
-            'smoothness': self._calculate_path_smoothness(path) if len(path) > 2 else 0
-        }
-    
-    # ==================== 环境信息获取 ====================
-    
-    def get_environment_info(self) -> Dict[str, Any]:
-        """获取环境信息"""
-        return {
-            'bounds': {
-                'x': self.xrange,
-                'y': self.yrange,
-                'z': self.zrange
-            },
-            'start': {
-                'position': self.startpos.tolist(),
-                'orientation': self.startges.tolist()
-            },
-            'target': {
-                'position': self.targetpos.tolist(),
-                'orientation': self.targetges.tolist()
-            },
-            'obstacles': len(self.obstacles),
-            'tool_size': self.tool_size,
-            'safe_distance': self.safe_distance,
-            'reach_distance': self.reach_distance,
-            'reach_angle': self.reach_ges
-        }
-    
-    def get_current_state(self) -> Dict[str, Any]:
-        """获取当前状态"""
-        return {
-            'position': self.nowpos.tolist(),
-            'orientation': self.nowges.tolist(),
-            'distance_to_target': calculate_distance(self.nowpos, self.targetpos),
-            'distance_to_goal_orientation': calculate_distance(self.nowges, self.targetges),
-            'timestep': self.timestep,
-            'trajectory_length': len(self.trajectory)
-        }
-    
-    def get_planning_stats(self) -> Dict[str, Any]:
-        """获取规划统计信息"""
-        return self._planning_state.copy()
-    
-    # ==================== 障碍物管理 ====================
-    
-    def append_obstacle(self, obstacle) -> None:
-        """添加障碍物"""
-        self.obstacles.append(obstacle)
-    
-    def clear_obstacles(self) -> None:
-        """清空所有障碍物"""
-        self.obstacles = []
-    
-    def set_obstacles(self, obstacles: List) -> None:
-        """设置障碍物列表"""
-        self.obstacles = obstacles
-    
-    def generate_obstacles(self) -> None:
-        """生成多种类型的障碍物"""
+    def _generate_valid_obstacles(self):
+        max_attempts = 100
         self.obstacles = []
         
         for _ in range(self.obstacles_num):
-            pos = np.array([
-                np.random.uniform(self.xrange[0], self.xrange[1]),
-                np.random.uniform(self.yrange[0], self.yrange[1]),
-                np.random.uniform(self.zrange[0], self.zrange[1])
-            ])
+            for _ in range(max_attempts):
+                # 随机生成位置
+                pos = np.array([
+                    self.np_random.uniform(self.x_range[0], self.x_range[1]),
+                    self.np_random.uniform(self.y_range[0], self.y_range[1]),
+                    self.np_random.uniform(self.z_range[0], self.z_range[1])
+                ])
+                
+                # 随机类型
+                obs_type = self.np_random.choice(['sphere', 'cylinder', 'box'])
+                if obs_type == 'sphere':
+                    obs = Sphere(self.np_random.uniform(2, 5), pos)
+                elif obs_type == 'cylinder':
+                    obs = Cylinder(self.np_random.uniform(2, 6), self.np_random.uniform(1, 3), pos)
+                else:
+                    obs = Cuboid(self.np_random.uniform(3, 8, size=3), pos)
+                
+                # 简单检查：起点和终点必须是安全的
+                # 注意：这里仅检查质心距离，严格来说应该做 Collision Check
+                d_start = calculate_distance(self.start_pos, pos)
+                d_target = calculate_distance(self.target_pos, pos)
+                safe_margin = self.safe_distance + obs.equivalentRadius
+                
+                if d_start > safe_margin and d_target > safe_margin:
+                    self.obstacles.append(obs)
+                    break
+
+    def _check_collision(self) -> bool:
+        req = fcl.CollisionRequest()
+        
+        for obs in self.obstacles:
+            res = fcl.CollisionResult()
+            fcl.collide(self.moving_tool.modelforfcl, obs.modelforfcl, req, res)
+            if res.is_collision:
+                return True
+        return False
+
+    def _check_out_of_bounds(self) -> bool:
+        x, y, z = self.now_pos
+        return not (self.x_range[0] <= x <= self.x_range[1] and
+                    self.y_range[0] <= y <= self.y_range[1] and
+                    self.z_range[0] <= z <= self.z_range[1])
+
+    def _is_success(self, pos, ges, target_pos, target_ges) -> bool:
+        d_pos = calculate_distance(pos, target_pos)
+        d_ges = calculate_distance(ges, target_ges)
+        return (d_pos < self.reach_dist_threshold) and (d_ges < self.reach_ges_threshold)
+
+    def _compute_dense_reward(self, success, collision, timeout):
+        # 1. 基础距离奖励 (归一化)
+        d_pos = calculate_distance(self.now_pos, self.target_pos)
+        d_ges = calculate_distance(self.now_ges, self.target_ges)
+        r_dist = -(d_pos / self.goal_dist_init) - (d_ges / self.goal_ges_init)
+        
+        # 2. 引导奖励 (Direction Reward)
+        r_dir = 0
+        vec_to_target = self.target_pos - self.now_pos
+        vec_move = self.now_pos - self.last_pos
+        if np.linalg.norm(vec_to_target) > 1e-5 and np.linalg.norm(vec_move) > 1e-5:
+            cos_sim = np.dot(vec_to_target, vec_move) / (np.linalg.norm(vec_to_target) * np.linalg.norm(vec_move))
+            r_dir = 2.0 * cos_sim
             
-            # 障碍物类型：球体、圆柱体、长方体
-            obs_type = random.choice(['sphere', 'cylinder', 'box'])
-            
-            if obs_type == 'sphere':
-                radius = np.random.uniform(2, 5)
-                obstacle = Sphere(radius, pos)
-            elif obs_type == 'cylinder':
-                radius = np.random.uniform(1, 3)
-                height = np.random.uniform(2, 6)
-                obstacle = Cylinder(height, radius, pos)
-            else:  # box
-                size = np.random.uniform(3, 8, size=3)
-                obstacle = Cuboid(size, pos)
-            
-            self.obstacles.append(obstacle)
-    
-    # ==================== 内部辅助方法 ====================
-    
-    def _execute_action(self, action: np.ndarray, compute_reward: bool = False) -> Tuple[Union[np.ndarray, Dict[str, np.ndarray]], float, bool, Dict]:
-        """执行动作的内部方法"""
-        self.lastpos = self.nowpos.copy()
-        self.lastges = self.nowges.copy()
-        self.lastpath = self.nowpos - self.lastpos
+        # 3. 避障奖励
+        r_obs = 0
+        for obs in self.obstacles:
+            d = calculate_distance(self.now_pos, obs.centerPoint)
+            if d < self.safe_distance:
+                r_obs -= (self.safe_distance - d) / self.safe_distance
+
+        # 4. 事件奖励
+        r_event = 0
+        if success: r_event += 100
+        if collision: r_event -= 50
+        if timeout: r_event -= 5
         
-        # 应用动作
-        scaled_action = action[0:3] * self.Vmax
-        self.nowpos = self.nowpos + scaled_action * self.period
-        self.nowges = self.nowges + action[3:6] * self.period
-        
-        # 更新工具
-        rotation_matrix = euler_to_rotation_matrix(
-            self.nowges[0], self.nowges[1], self.nowges[2]
-        )
-        self.moving_tool = Cylinder(
-            height=self.tool_size[0],
-            radius=self.tool_size[1],
-            centerPoint=self.nowpos,
-            orientation=rotation_matrix
-        )
-        self.trajectory.append(self.nowpos.copy())
-        self.timestep += 1
-        
-        # 更新状态
-        self.state = State(self)
-        
-        # 计算奖励（仅强化学习使用）
-        reward = 0
-        if compute_reward:
-            reward += self.stepReward()
-            reward += self.obstacleAwayReward()
-            reward += self.angleReward()
-        
-        # 终止判断
-        done = False
-        info = {
-            "nowpos": self.nowpos.copy(),
-            "nowges": self.nowges.copy(),
-            "target": self.target.copy(),
-            "planning_stats": self._planning_state.copy()
+        return r_dist + r_dir + r_obs + r_event
+
+    def _get_info(self):
+        return {
+            "pos": self.now_pos.copy(),
+            "target": self.target_pos.copy()
         }
-        
-        if self.judgeTarget():
-            self.trajectory.append(self.targetpos.copy())
-            if compute_reward:
-                reward += 100
-            done = True
-            info["terminal"] = "reached_target"
-        elif self.judgeObstacle():
-            if compute_reward:
-                reward += -50
-            done = True
-            info["terminal"] = "collision"
-        elif self.judgeTime():
-            if compute_reward:
-                reward += -5
-            done = True
-            info["terminal"] = "timeout"
-        
-        # 返回 observation 格式：若 goal_conditioned 则返回 dict 格式以便 HER 使用
-        if self.goal_conditioned:
-            obs_dict = self._build_goal_dict()
-            return obs_dict, reward, done, info
-        # 否则返回原始 flat state（向后兼容）
-        return self.state.states, reward, done, info
     
-    def _check_bounds(self, position: np.ndarray) -> bool:
-        """检查位置是否在边界内"""
-        x, y, z = position
-        return (self.xrange[0] <= x <= self.xrange[1] and
-                self.yrange[0] <= y <= self.yrange[1] and
-                self.zrange[0] <= z <= self.zrange[1])
-    
-    def _check_collision(self, tool) -> bool:
-        """检查工具是否与障碍物碰撞"""
-        for obstacle in self.obstacles:
-            request = fcl.CollisionRequest()
-            result = fcl.CollisionResult()
-            fcl.collide(tool.modelforfcl, obstacle.modelforfcl, request, result)
-            if result.is_collision:
-                return True
-        return False
-    
-    def _get_distances_to_obstacles(self) -> List[float]:
-        """获取到所有障碍物的距离"""
-        distances = []
-        for obstacle in self.obstacles:
-            distance = calculate_distance(self.nowpos, obstacle.centerPoint)
-            distances.append(distance)
-        return distances
-    
-    def _calculate_path_smoothness(self, path: List[np.ndarray]) -> float:
-        """计算路径平滑度（角度变化总和）"""
-        if len(path) < 3:
-            return 0
-        
-        total_angle = 0
-        for i in range(1, len(path)-1):
-            # 计算三个连续点形成的角度
-            p1 = path[i-1][:3] if len(path[i-1]) > 3 else path[i-1]
-            p2 = path[i][:3] if len(path[i]) > 3 else path[i]
-            p3 = path[i+1][:3] if len(path[i+1]) > 3 else path[i+1]
-            
-            v1 = p2 - p1
-            v2 = p3 - p2
-            
-            if np.linalg.norm(v1) > 1e-5 and np.linalg.norm(v2) > 1e-5:
-                cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
-                cos_angle = np.clip(cos_angle, -1.0, 1.0)
-                angle = np.arccos(cos_angle)
-                total_angle += angle
-        
-        return total_angle
-    
-    # ==================== 便捷接口 & HER 辅助方法 ====================
-    
-    def compute_reward_from_goal(self, achieved_goal: np.ndarray, desired_goal: np.ndarray, sparse: bool = True) -> float:
-        """根据 achieved_goal 与 desired_goal 计算与 HER 配合的 reward
-           - sparse=True: 返回 0 当成功 (dist < reach_distance) 否则 -1
-           - sparse=False: 返回 -distance(achieved, desired)
-        """
-        dist = calculate_distance(achieved_goal, desired_goal)
-        if sparse:
-            return 0.0 if dist < self.reach_distance else -1.0
-        else:
-            return -float(dist)
-    
-    def is_success(self, achieved_goal: np.ndarray, desired_goal: np.ndarray) -> bool:
-        """判断 achieved_goal 是否满足 desired_goal"""
-        return calculate_distance(achieved_goal, desired_goal) < self.reach_distance
-
-    # ==================== 原有功能保持兼容 ====================
-    
-    def stepReward(self) -> float:
-        """时间步奖励（强化学习专用）"""
-        step_reward = 0
-        
-        # 计算当前点与终点的距离和角度差
-        dis = calculate_distance(self.nowpos, self.targetpos)
-        dir_diff = calculate_distance(self.nowges, self.targetges)
-        base_reward = -dis/self.goal_distance - dir_diff/self.goal_dir_to_target
-        
-        # 方向一致性奖励
-        direction = self.targetpos - self.nowpos
-        movement = self.nowpos - self.lastpos
-        if np.linalg.norm(direction) > 1e-5 and np.linalg.norm(movement) > 1e-5:
-            cos_sim = np.dot(direction, movement) / (np.linalg.norm(direction) * np.linalg.norm(movement))
-            direction_reward = 2 * cos_sim
-        else:
-            direction_reward = 0
-        
-        step_reward += direction_reward
-        step_reward += base_reward
-        
-        self.last_dis_to_target = dis
-        self.last_dir_to_target = dir_diff
-        
-        return step_reward
-    
-    def obstacleAwayReward(self) -> float:
-        """远离障碍物奖励（强化学习专用）"""
-        obstacle_away_reward = 0
-        for obstacle in self.obstacles:
-            dis_to_obstacle = calculate_distance(self.nowpos, obstacle.centerPoint)
-            if dis_to_obstacle < self.safe_distance:
-                obstacle_away_reward -= (self.safe_distance - dis_to_obstacle) / self.safe_distance
-        return obstacle_away_reward
-    
-    def angleReward(self) -> float:
-        """转角奖励（强化学习专用）"""
-        angle_reward = 0
-        now_path = self.nowpos - self.lastpos
-        
-        if np.linalg.norm(self.lastpath) > 1e-5 and np.linalg.norm(now_path) > 1e-5:
-            angle = calculate_angle(now_path, self.lastpath)
-            if angle > self.alpha_max:
-                angle_reward += -5
-        
-        return angle_reward
-    
-    def judgeTarget(self) -> bool:
-        """判断是否到达目标点"""
-        pos_distance = calculate_distance(self.nowpos, self.targetpos)
-        ges_distance = calculate_distance(self.nowges, self.targetges)
-        return pos_distance < self.reach_distance and ges_distance < self.reach_ges
-    
-    def judgeObstacle(self) -> bool:
-        """判断是否碰撞或超出边界"""
-        # 检查边界
-        x, y, z = self.nowpos
-        if not (self.xrange[0] <= x <= self.xrange[1] and
-                self.yrange[0] <= y <= self.yrange[1] and
-                self.zrange[0] <= z <= self.zrange[1]):
-            return True
-        
-        # 检查障碍物碰撞
-        for obstacle in self.obstacles:
-            request = fcl.CollisionRequest()
-            result = fcl.CollisionResult()
-            fcl.collide(self.moving_tool.modelforfcl, obstacle.modelforfcl, request, result)
-            if result.is_collision:
-                return True
-        
-        return False
-    
-    def judgeTime(self) -> bool:
-        """判断是否超时"""
-        return self.timestep >= self.maxstep
-    
-    def render(self, pic_path: str = None, info: Dict = None) -> None:
-        """渲染环境"""
-        if pic_path is not None:
-            save_plot_3d_path(
-                self.trajectory,
-                np.concatenate((self.xrange, self.yrange, self.zrange), axis=0),
-                self.obstacles,
-                pic_path,
-                info
-            )
-    
-    # ==================== 便捷属性 ====================
-    
-    @property
-    def is_done(self) -> bool:
-        """环境是否终止"""
-        return self.done
-    
-    @property
-    def current_position(self) -> np.ndarray:
-        """当前位置"""
-        return self.nowpos.copy()
-    
-    @property
-    def current_orientation(self) -> np.ndarray:
-        """当前姿态"""
-        return self.nowges.copy()
-    
-    @property
-    def path_taken(self) -> List[np.ndarray]:
-        """已经走过的路径"""
-        return self.trajectory.copy()
-
-# 其余示例函数保持不变（若使用 goal_conditioned=True，调用者需要适配 dict 返回）
+    def render(self):
+        if self.render_mode == "human":
+            # 调用 util 中的绘图，或者这里实现简单的 print
+            pass
+        elif self.render_mode == "rgb_array":
+            # 返回图像数组
+            pass

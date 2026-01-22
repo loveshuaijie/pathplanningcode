@@ -353,7 +353,7 @@ def evaluate_model(model_path, config_path="AxisPathPlanEnv/env_config.yaml",
             targetges = np.random.uniform(low=-np.pi, high=np.pi, size=(3,))
             target = np.concatenate((targetpos, targetges))
             
-            obs = env.reset(target=target, generate_obstacles=True)
+            obs = env.reset(target_random_flag=True, obstacles_random_flag=True)
         else:
             # 使用配置中的固定目标点
             obs = env.reset(generate_obstacles=True)
@@ -583,7 +583,7 @@ if __name__ == "__main__":
     
     # 创建命令行参数解析器
     parser = argparse.ArgumentParser(description='SAC路径规划训练和评估')
-    parser.add_argument('--mode', type=str, default='train', 
+    parser.add_argument('--mode', type=str, default='eval', 
                        choices=['train', 'eval', 'train_manual', 'visualize'],
                        help='运行模式: train(训练), eval(评估), train_manual(手动训练), visualize(可视化)')
     parser.add_argument('--model_path', type=str, default='./models/sac_final',

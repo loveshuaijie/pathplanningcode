@@ -1,222 +1,130 @@
-"""
-3D APF (Artificial Potential Field) planner for MapEnv
-
-Usage:
-    from AxisPathPlanEnv.MapEnv import MapEnv
-    from planners.apf_3d import apf_plan
-
-    env = MapEnv(config)
-    path = apf_plan(env, max_iters=2000, step_size=0.5, k_att=1.0, k_rep=50.0)
-    # path: list of waypoints (each is np.array length 6: x,y,z,rx,ry,rz) if successful; else None
-"""
-
-import copy
-import math
 import numpy as np
-from typing import List, Optional
+import fcl
+import sys
 
-def _clone_env_for_planning(env):
-    """
-    Create a fresh MapEnv instance with same configuration and obstacles,
-    and reset it to the same start/target as env. This avoids mutating the
-    original env during planning (MapEnv.plan_step mutates).
-    """
-    # Reconstruct config from env attributes
-    cfg = {
-        "envxrange": env.xrange,
-        "envyrange": env.yrange,
-        "envzrange": env.zrange,
-        "obstacles_num": env.obstacles_num,
-        "start": np.concatenate([env.startpos, env.startges]).tolist(),
-        "target": np.concatenate([env.targetpos, env.targetges]).tolist(),
-        "tool_size": env.tool_size,
-        "maxstep": env.maxstep,
-        "period": env.period,
-        "safe_distance": env.safe_distance,
-        "alpha_max": env.alpha_max,
-        "reachpos_scale": env.reachpos_scale,
-        "reachges_scale": env.reachges_scale,
-        "Vmax": env.Vmax,
-        # preserve goal_conditioned if present
-        "goal_conditioned": getattr(env, "goal_conditioned", False)
-    }
-    from AxisPathPlanEnv.MapEnv import MapEnv
-    plan_env = MapEnv(cfg)
-    # set exact same obstacles (reuse objects)
-    try:
-        plan_env.set_obstacles(env.obstacles)
-    except Exception:
-        # fallback: try append
-        plan_env.clear_obstacles()
-        for o in env.obstacles:
-            plan_env.append_obstacle(o)
-    # reset with same start/target and no random obstacle generation
-    plan_env.reset(start=np.concatenate([env.startpos, env.startges]),
-                   target=np.concatenate([env.targetpos, env.targetges]),
-                   generate_obstacles=False)
-    return plan_env
+sys.path.append('E:\pathplanning\pathplanningcode')
 
-def _to_waypoint(pos3, ori3):
-    arr = np.zeros(6, dtype=float)
-    arr[0:3] = pos3
-    arr[3:6] = ori3
-    return arr
+from AxisPathPlanEnv.MapEnv import MapEnv
+from AxisPathPlanEnv.Prime import Cylinder
+from AxisPathPlanEnv.util import calculate_distance, save_plot_3d_path
 
-def apf_plan(env,
-             max_iters: int = 2000,
-             step_size: float = 0.5,
-             k_att: float = 1.0,
-             k_rep: float = 50.0,
-             repulse_range: float = 3.0,
-             tol: float = 0.5,
-             random_escape_prob: float = 0.1,
-             max_random_escapes: int = 20) -> Optional[List[np.ndarray]]:
-    """
-    APF planner in 3D.
+class APFPlanner:
+    def __init__(self, env):
+        self.env = env
+        self.k_att = 5.0        # 引力增益
+        self.k_rep = 10.0      # 斥力增益
+        self.rho_0 = 3.0        # 斥力影响范围 (感知半径)
+        self.step_size = 0.1    # 梯度下降步长
+        self.max_iters = 2000   # 最大迭代次数
+        
+    def get_att_force(self, current_pos, target_pos):
+        """计算引力: F_att = k * (target - current)"""
+        vec = target_pos - current_pos
+        dist = np.linalg.norm(vec)
+        if dist < 1e-5:
+            return np.zeros(3)
+        # 这里的引力可以是线性的，也可以是二次的，这里用线性引导
+        return self.k_att * vec 
 
-    Args:
-      env: existing MapEnv instance (used to get config/obstacles/start/target)
-      max_iters: max iterations for APF updates
-      step_size: movement per iteration
-      k_att: attractive force coefficient
-      k_rep: repulsive force coefficient
-      repulse_range: distance within which obstacles repel
-      tol: distance to goal threshold to stop (meters)
-      random_escape_prob: probability to attempt small random perturbation when stuck
-      max_random_escapes: max number of random escape attempts total
+    def get_rep_force(self, current_pos):
+        """计算斥力: 基于 FCL 最近距离"""
+        total_rep_force = np.zeros(3)
+        
+        # 创建一个临时的工具模型用于检测距离
+        # 注意：这里简化处理，只考虑位置，忽略姿态对形状的影响（假设工具是球或直立圆柱）
+        temp_tool = Cylinder(height=self.env.tool_size[0], radius=self.env.tool_size[1], centerPoint=current_pos)
+        
+        req = fcl.DistanceRequest(enable_nearest_points=True)
+        
+        
+        for obs in self.env.obstacles:
+            res = fcl.DistanceResult()
+            dist = fcl.distance(temp_tool.modelforfcl, obs.modelforfcl, req, res)
+            
+            # 如果在斥力范围内
+            if dist < self.rho_0:
+                if dist <= 0.1: dist = 0.1 # 防止除零
+                
+                # 计算斥力向量方向：从障碍物指向工具
+                # FCL nearest_points[0] 是 obs 上的点，[1] 是 tool 上的点
+                # 我们需要 tool - obs 的方向
+                obs_point = np.array(res.nearest_points[0])
+                tool_point = np.array(res.nearest_points[1])
+                
+                rep_vec = tool_point - obs_point
+                rep_vec_norm = np.linalg.norm(rep_vec)
+                
+                if rep_vec_norm > 1e-6:
+                    unit_rep_vec = rep_vec / rep_vec_norm
+                else:
+                    unit_rep_vec = np.random.uniform(-1, 1, 3) # 随机扰动防止重合
+                    unit_rep_vec /= np.linalg.norm(unit_rep_vec)
 
-    Returns:
-      path: list of 6-dim waypoints (x,y,z,rx,ry,rz) or None if planning failed
-    """
-    plan_env = _clone_env_for_planning(env)
-    start_pos = plan_env.startpos.copy()
-    start_ori = plan_env.startges.copy()
-    goal_pos = plan_env.targetpos.copy()
-    goal_ori = plan_env.targetges.copy()
+                # 斥力公式 (标准 APF)
+                # F = k * (1/d - 1/rho0) * (1/d^2) * unit_vec
+                force_val = self.k_rep * (1.0/dist - 1.0/self.rho_0) * (1.0/(dist**2))
+                total_rep_force += force_val * unit_rep_vec
+                
+        return total_rep_force
 
-    current = start_pos.copy()
-    path = [_to_waypoint(current, start_ori)]
-    prev_norm = None
-    escapes = 0
-
-    for it in range(max_iters):
-        # attractive force: proportional to vector to goal
-        diff = goal_pos - current
-        dist_to_goal = np.linalg.norm(diff)
-        if dist_to_goal < tol:
-            # reached
-            path.append(_to_waypoint(goal_pos, goal_ori))
-            return path
-
-        f_att = k_att * diff  # vector
-
-        # repulsive forces from obstacles (point obstacles approximated by center)
-        f_rep = np.zeros(3, dtype=float)
-        for obs in plan_env.obstacles:
-            # distance from current to obstacle center (approx)
-            obs_center = np.array(obs.centerPoint, dtype=float)
-            d = np.linalg.norm(current - obs_center)
-            if d < 1e-6:
-                d = 1e-6
-            if d <= repulse_range:
-                # direction away from obstacle
-                dir_away = (current - obs_center) / d
-                # magnitude
-                mag = k_rep * (1.0 / d - 1.0 / repulse_range) / (d * d)
-                f_rep += mag * dir_away
-
-        f_total = f_att + f_rep
-        # normalize and scale by step_size (to get next position)
-        norm = np.linalg.norm(f_total)
-        if norm < 1e-6:
-            # likely local minimum; try random escape
-            if escapes < max_random_escapes and np.random.rand() < random_escape_prob:
-                rand_dir = np.random.randn(3)
-                rand_dir = rand_dir / (np.linalg.norm(rand_dir) + 1e-9)
-                candidate = current + rand_dir * step_size
-                escapes += 1
+    def plan(self, start_pos, target_pos):
+        path = [start_pos.copy()]
+        current_pos = start_pos.copy()
+        
+        print("APF Planning started...")
+        for i in range(self.max_iters):
+            # 1. 检查是否到达目标
+            if np.linalg.norm(current_pos - target_pos) < 0.2:
+                path.append(target_pos.copy())
+                print(f"APF Reached Target in {i} steps!")
+                return np.array(path), True
+            
+            # 2. 计算受力
+            f_att = self.get_att_force(current_pos, target_pos)
+            f_rep = self.get_rep_force(current_pos)
+            
+            f_total = f_att + f_rep
+            
+            # 3. 梯度下降更新位置
+            # 归一化合力方向，防止步长过大
+            f_norm = np.linalg.norm(f_total)
+            if f_norm > 1e-5:
+                direction = f_total / f_norm
+                current_pos += direction * self.step_size
             else:
-                # stuck -> fail
-                return None
-        else:
-            direction = f_total / norm
-            candidate = current + direction * step_size
+                # 陷入局部极小值，加随机扰动
+                current_pos += np.random.uniform(-0.1, 0.1, 3)
+            
+            # 越界检查
+            current_pos = np.clip(current_pos, 
+                                  [self.env.x_range[0], self.env.y_range[0], self.env.z_range[0]],
+                                  [self.env.x_range[1], self.env.y_range[1], self.env.z_range[1]])
+            
+            path.append(current_pos.copy())
+            
+        print("APF Timeout: Local Minima or too far.")
+        return np.array(path), False
 
-        # enforce bounds
-        candidate[0] = np.clip(candidate[0], plan_env.xrange[0], plan_env.xrange[1])
-        candidate[1] = np.clip(candidate[1], plan_env.yrange[0], plan_env.yrange[1])
-        candidate[2] = np.clip(candidate[2], plan_env.zrange[0], plan_env.zrange[1])
-
-        # test collision by plan_step on cloned env (we use same orientation)
-        res = plan_env.plan_step(candidate, plan_env.nowges)
-        if res.get('success', False) and not res.get('collision', False):
-            current = candidate
-            path.append(_to_waypoint(current, start_ori))
-            # continue
-        else:
-            # collision - try small orthogonal perturbations (simple local navigation)
-            collided = True
-            found = False
-            for attempt in range(6):
-                angle = (attempt / 6.0) * 2 * math.pi
-                # create orthogonal small offset
-                offset = np.array([math.cos(angle), math.sin(angle), 0.0], dtype=float) * (step_size * 0.5)
-                candidate2 = current + offset
-                candidate2[0] = np.clip(candidate2[0], plan_env.xrange[0], plan_env.xrange[1])
-                candidate2[1] = np.clip(candidate2[1], plan_env.yrange[0], plan_env.yrange[1])
-                candidate2[2] = np.clip(candidate2[2], plan_env.zrange[0], plan_env.zrange[1])
-                res2 = plan_env.plan_step(candidate2, plan_env.nowges)
-                if res2.get('success', False) and not res2.get('collision', False):
-                    current = candidate2
-                    path.append(_to_waypoint(current, start_ori))
-                    found = True
-                    break
-            if not found:
-                # try random escape if allowed
-                if escapes < max_random_escapes:
-                    rand_dir = np.random.randn(3)
-                    rand_dir /= (np.linalg.norm(rand_dir) + 1e-9)
-                    candidate3 = current + rand_dir * step_size
-                    candidate3[0] = np.clip(candidate3[0], plan_env.xrange[0], plan_env.xrange[1])
-                    candidate3[1] = np.clip(candidate3[1], plan_env.yrange[0], plan_env.yrange[1])
-                    candidate3[2] = np.clip(candidate3[2], plan_env.zrange[0], plan_env.zrange[1])
-                    res3 = plan_env.plan_step(candidate3, plan_env.nowges)
-                    if res3.get('success', False) and not res3.get('collision', False):
-                        current = candidate3
-                        path.append(_to_waypoint(current, start_ori))
-                        escapes += 1
-                        continue
-                # cannot find non-colliding candidate -> fail
-                return None
-
-    # max_iters reached
-    return None
-
-
-# Example quick test (not executed on import)
+# --- 运行测试 ---
 if __name__ == "__main__":
-    
-    import sys
-
-    sys.path.append('E:\pathplanning\pathplanningcode')
-    from AxisPathPlanEnv.MapEnv import MapEnv
-    # Provide your env_config path or dict here for testing
-    cfg = {
-        "envxrange": [-10, 10],
-        "envyrange": [-10, 10],
-        "envzrange": [-10, 10],
-        "obstacles_num": 8,
-        "start": [0,0,0,0,0,0],
-        "target": [6,6,6,0,0,0],
-        "tool_size": [2.0, 0.5],
-        "maxstep": 1000,
-        "period": 0.1,
-        "safe_distance": 1.0,
-        "alpha_max": math.pi/4,
-        "reachpos_scale": 10.0,
-        "reachges_scale": 10.0,
-        "Vmax": 1.0
+    # 配置
+    config = {
+        "envxrange": [-10, 10], "envyrange": [-10, 10], "envzrange": [-10, 10],
+        "obstacles_num": 5, "safe_distance": 1.0, "tool_size": [2.0, 0.5],
+        "maxstep": 100, "period": 0.1, "alpha_max": 1.0,
+        "start": [0,0,0,0,0,0], "target": [8,8,8,0,0,0] # 距离远一点，测试避障
     }
-    env = MapEnv(cfg)
-    p = apf_plan(env)
-    print("APF path:", p)
+    
+    # 初始化环境
+    env = MapEnv(config)
+    env.reset() # 生成随机障碍物
+    
+    # 规划
+    planner = APFPlanner(env)
+    path, success = planner.plan(env.start_pos, env.target_pos)
+    
+    # 绘图
+    bounds = np.concatenate([env.x_range, env.y_range, env.z_range])
+    save_plot_3d_path(path, bounds, env.obstacles, "result_apf.png", 
+                      info={"algorithm": "APF", "success": success})
+    print("Result saved to result_apf.png")
